@@ -1,14 +1,15 @@
 import logging
 import threading
 import warnings
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from typing import TYPE_CHECKING, Any, Literal
+from uuid import uuid4
 
-from sqlalchemy import false, func, select
-from sqlalchemy.exc import NoSuchTableError
+from sqlalchemy import MetaData, and_, false, func, or_, select
+from sqlalchemy.exc import NoSuchTableError, ResourceClosedError
 from sqlalchemy.schema import Column, Index
 from sqlalchemy.schema import Table as SQLATable
-from sqlalchemy.sql import and_, expression
+from sqlalchemy.sql import expression
 from sqlalchemy.sql.expression import (
     ClauseElement,
     ColumnElement,
@@ -18,8 +19,10 @@ from sqlalchemy.sql.expression import (
 
 from dataset.types import MYSQL_LENGTH_TYPES, ColumnType, Types
 from dataset.util import (
+    KEY_INSERT_CHUNK_SIZE,
     QUERY_STEP,
     DatasetError,
+    KeyedResultIter,
     MutableRow,
     OutRow,
     QueryError,
@@ -38,6 +41,10 @@ if TYPE_CHECKING:
     from dataset.database import Database
 
 log = logging.getLogger(__name__)
+
+# A composite business key is an ordered tuple of SQL-compatible values, one
+# per key column.
+BusinessKey = tuple[SQLWriteValue, ...]
 
 
 class Table:
@@ -578,6 +585,132 @@ class Table:
         args = {k: row_.pop(k, None) for k in keys}
         return args, row_
 
+    def _normalize_key_columns(self, key_columns: str | Sequence[str]) -> list[str]:
+        """Resolve the key columns of a composite key to real column names."""
+        columns = [self._get_column_name(c) for c in ensure_strings(key_columns)]
+        if not columns:
+            raise QueryError("find_by_keys requires at least one key column")
+        for column in columns:
+            if not self.has_column(column):
+                raise QueryError(f"No such column: {column}")
+        return columns
+
+    def _coerce_business_key(
+        self, key: Any, columns: list[str]
+    ) -> BusinessKey:
+        """Turn one input item into a value tuple aligned with ``columns``."""
+        if isinstance(key, Mapping):
+            resolved = {
+                self._get_column_name(name): value for name, value in key.items()
+            }
+            return tuple(resolved.get(column) for column in columns)
+        if len(columns) == 1 and not isinstance(key, (list, tuple)):
+            return (key,)
+        if not isinstance(key, (list, tuple)):
+            raise QueryError(
+                "Composite keys must be given as tuples (one value per "
+                f"key column), got {type(key).__name__}"
+            )
+        values = tuple(key)
+        if len(values) != len(columns):
+            raise QueryError(
+                f"Expected {len(columns)} key values, got {len(values)}: {key!r}"
+            )
+        return values
+
+    def _dedupe_keys(self, keys: Iterable[BusinessKey]) -> list[BusinessKey]:
+        """Drop repeated keys without changing their first-seen order.
+
+        JSON-style list/dict values are not hashable, so unhashable keys fall
+        back to an equality check against the already-seen keys.
+        """
+        unique: list[BusinessKey] = []
+        hashable: set[BusinessKey] = set()
+        for key in keys:
+            try:
+                if key in hashable:
+                    continue
+                hashable.add(key)
+            except TypeError:
+                if key in unique:
+                    continue
+            unique.append(key)
+        return unique
+
+    def _create_key_table(
+        self, columns: list[str], keys: Sequence[BusinessKey]
+    ) -> SQLATable:
+        """Stage the deduplicated key list in a temporary table.
+
+        The temporary relation is created on the current thread's connection,
+        so it shares the surrounding transaction (if any) and is invisible to
+        other connections. Inserts are batched to keep the number of bind
+        parameters per statement within backend limits.
+        """
+        key_table = SQLATable(
+            f"tmp_dataset_keys_{uuid4().hex[:16]}",
+            MetaData(),
+            *[
+                Column(column, self.table.c[column].type)
+                for column in columns
+            ],
+            prefixes=["TEMPORARY"],
+        )
+        try:
+            key_table.create(self.db.executable, checkfirst=True)
+            self.db.register_temp_table(key_table)
+            rows = [dict(zip(columns, key)) for key in keys]
+            for start in range(0, len(rows), KEY_INSERT_CHUNK_SIZE):
+                batch = rows[start : start + KEY_INSERT_CHUNK_SIZE]
+                self.db.executable.execute(key_table.insert(), batch)
+        except Exception:
+            if key_table.exists(bind=self.db.executable):
+                self._drop_key_table(key_table)
+            raise
+        return key_table
+
+    def _drop_key_table(self, key_table: SQLATable) -> None:
+        """Remove temporary key state without touching an outer transaction.
+
+        Temporary tables are session-local, so a rollback or a connection
+        being returned to the pool already discards them. No commit is ever
+        issued here: inside an explicit transaction the DROP rides along with
+        it. ``Database._release_connection`` provides a safety net that drops
+        any leftovers when a connection is closed or a transaction rolled
+        back.
+        """
+        try:
+            key_table.drop(self.db.executable, checkfirst=True)
+        except ResourceClosedError:
+            # The result outlived an explicit rollback that released the
+            # connection; the temporary table is gone together with it.
+            pass
+        finally:
+            self.db.unregister_temp_table(key_table)
+
+    def _key_join_clause(
+        self,
+        columns: list[str],
+        key_table: SQLATable,
+        nulls_equal: bool,
+    ) -> ColumnElement[bool]:
+        """Build the per-column equality conditions of the key join."""
+        conditions = []
+        for column in columns:
+            main_column = self.table.c[column]
+            key_column = key_table.c[column]
+            if nulls_equal:
+                condition = or_(
+                    main_column == key_column,
+                    and_(main_column.is_(None), key_column.is_(None)),
+                )
+            else:
+                # SQL NULL semantics: NULL = NULL is not true, so keys
+                # containing NULL never match rows.
+                condition = main_column == key_column
+            conditions.append(condition)
+        return and_(True, *conditions)
+
     def create_column(
         self, name: str, type: ColumnType, **kwargs: object  # noqa: A002
     ) -> None:
@@ -817,6 +950,136 @@ class Table:
         res = rp.fetchone()
         if res is not None:
             return int(res[0])
+        return 0
+
+    def find_by_keys(
+        self,
+        keys: Iterable[Any],
+        key_columns: str | Sequence[str],
+        *,
+        nulls_equal: bool = False,
+        columns: Sequence[str] | None = None,
+        order_by: str | Sequence[str] | None = None,
+        _limit: int | None = None,
+        _offset: int = 0,
+    ) -> ResultIter:
+        """Find rows matching a (possibly large) list of composite keys.
+
+        Unlike an ``IN`` filter, this works for composite business keys and
+        for key lists that exceed the database's parameter limit. The keys are
+        deduplicated and staged in a temporary table on the current
+        connection, then joined against this table. Ordering, limit, offset
+        and projection are applied to the complete joined result in SQL, so
+        pagination stays correct regardless of how many batches the key list
+        was inserted in.
+
+        ``keys`` may be a one-shot iterator. For a single ``key_column`` each
+        item can be a scalar value; for composite keys each item must be a
+        tuple with one value per key column (mappings keyed by column name are
+        also accepted). Repeated keys only produce one filter condition, while
+        duplicate rows stored in the table itself are all returned.
+
+        By default SQL NULL semantics apply and keys containing ``None`` do
+        not match anything. Pass ``nulls_equal=True`` to treat NULL values on
+        both sides as equal.
+
+        The whole query is executed in SQL (including ordering, limit and
+        offset); the matched rows are then fetched and the temporary table is
+        dropped before the iterator is returned, so no temporary state can
+        leak, including on early closes or query errors.
+        ::
+
+
+            rows = table.find_by_keys(
+                [("Berlin", 2011), ("Paris", 2012)],
+                ["place", "year"],
+                order_by="-year",
+                _limit=10,
+            )
+        """
+        if not self.exists:
+            return ResultIter(None, row_type=self.db.row_type)
+        if self.db.engine is None:
+            raise RuntimeError("Cannot run queries when no engine is available.")
+
+        resolved_keys = self._normalize_key_columns(key_columns)
+        orderings = self._args_to_order_by(order_by)
+        projection = None
+        if columns is not None:
+            projected = [self._get_column_name(c) for c in ensure_strings(columns)]
+            for column in projected:
+                if not self.has_column(column):
+                    raise QueryError(f"No such column: {column}")
+            projection = [self.table.c[column] for column in projected]
+
+        unique_keys = self._dedupe_keys(
+            self._coerce_business_key(key, resolved_keys) for key in keys
+        )
+        if not unique_keys:
+            return ResultIter(None, row_type=self.db.row_type)
+        key_table = self._create_key_table(resolved_keys, unique_keys)
+
+        join_clause = self._key_join_clause(
+            resolved_keys, key_table, nulls_equal
+        )
+        if projection is None:
+            query = select(self.table)
+        else:
+            query = select(*projection)
+        query = query.select_from(
+            self.table.join(key_table, onclause=join_clause)
+        )
+        query = query.limit(_limit).offset(_offset)
+        if len(orderings):
+            query = query.order_by(*orderings)
+
+        try:
+            result = self.db.executable.execute(query)
+            fetched = result.fetchall()
+        except Exception:
+            raise
+        else:
+            result.close()
+        finally:
+            self._drop_key_table(key_table)
+        return KeyedResultIter.from_rows(fetched, row_type=self.db.row_type)
+
+    def count_by_keys(
+        self,
+        keys: Iterable[Any],
+        key_columns: str | Sequence[str],
+        *,
+        nulls_equal: bool = False,
+    ) -> int:
+        """Count the rows matched by :meth:`find_by_keys`.
+
+        Accepts the same key list, key columns and ``nulls_equal`` flag as
+        :meth:`find_by_keys` and returns the number of rows in the table that
+        the key join matches. Duplicate rows in the table are counted.
+        """
+        if not self.exists:
+            return 0
+
+        resolved_keys = self._normalize_key_columns(key_columns)
+        unique_keys = self._dedupe_keys(
+            self._coerce_business_key(key, resolved_keys) for key in keys
+        )
+        if not unique_keys:
+            return 0
+        key_table = self._create_key_table(resolved_keys, unique_keys)
+        try:
+            join_clause = self._key_join_clause(
+                resolved_keys, key_table, nulls_equal
+            )
+            query = select(func.count()).select_from(
+                self.table.join(key_table, onclause=join_clause)
+            )
+            result = self.db.executable.execute(query)
+            row = result.fetchone()
+        finally:
+            self._drop_key_table(key_table)
+        if row is not None:
+            return int(row[0])
         return 0
 
     def __len__(self) -> int:

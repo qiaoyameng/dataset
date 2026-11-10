@@ -1,6 +1,6 @@
 import logging
 import threading
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 from urllib.parse import parse_qs, urlparse
 
 from alembic.migration import MigrationContext
@@ -21,6 +21,9 @@ from dataset.util import (
     row_factory,
     safe_url,
 )
+
+if TYPE_CHECKING:
+    from sqlalchemy.schema import Table as SQLATable
 
 log = logging.getLogger(__name__)
 
@@ -51,6 +54,10 @@ class Database:
         self.lock = threading.RLock()
         self.local = threading.local()
         self.connections: dict[int, Connection] = {}
+        # Session-local temporary tables keyed by the connection they live
+        # on. TEMP tables are invisible to other connections and must be
+        # dropped when the connection is released, in particular on rollback.
+        self._temp_tables: dict[Connection, list[SQLATable]] = {}
 
         if len(parsed_url.query):
             query = parse_qs(parsed_url.query)
@@ -131,7 +138,34 @@ class Database:
             tid = threading.get_ident()
             conn = self.connections.pop(tid, None)
             if conn is not None:
+                leftovers = self._temp_tables.pop(conn, [])
+                if leftovers and not conn.closed:
+                    for table in leftovers:
+                        try:
+                            table.drop(conn, checkfirst=True)
+                        except Exception:
+                            # Closing the connection destroys its
+                            # session-local temporary tables anyway; a
+                            # lingering cursor or an already-aborted
+                            # transaction must not block the release.
+                            log.debug(
+                                "Could not drop temporary table %s",
+                                table.name,
+                                exc_info=True,
+                            )
                 conn.close()
+
+    def register_temp_table(self, table: "SQLATable") -> None:
+        """Track a session-local temporary table for connection cleanup."""
+        with self.lock:
+            self._temp_tables.setdefault(self.executable, []).append(table)
+
+    def unregister_temp_table(self, table: "SQLATable") -> None:
+        """Stop tracking a temporary table that has been dropped."""
+        with self.lock:
+            for tables in self._temp_tables.values():
+                if table in tables:
+                    tables.remove(table)
 
     def _flush_tables(self) -> None:
         """Clear the table metadata after transaction rollbacks."""

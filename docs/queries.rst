@@ -68,6 +68,47 @@ These clauses also work with :py:meth:`table.count() <dataset.Table.count>`,
 :py:meth:`table.find_one() <dataset.Table.find_one>`, and
 :py:meth:`table.delete() <dataset.Table.delete>`.
 
+Finding rows by a list of composite keys
+----------------------------------------
+
+An ``IN`` filter becomes awkward for composite business keys, and a long key
+list can exceed the database's parameter limit (for example SQLite allows at
+most 999 host variables per statement). :py:meth:`table.find_by_keys()
+<dataset.Table.find_by_keys>` instead stages the deduplicated key list in a
+session-local temporary table and joins it against the target table, so it
+works for arbitrarily long key lists and multi-column keys::
+
+    rows = table.find_by_keys(
+        [('Berlin', 2011), ('Paris', 2012)],
+        key_columns=['place', 'year'],
+    )
+
+The key list may be a one-shot iterator. With a single key column each item
+can be a scalar; for composite keys pass one tuple per key (mappings keyed by
+column name are accepted as well). Repeated keys produce only one filter
+condition, while duplicate rows stored in the table are all returned.
+
+By default SQL NULL semantics apply, so keys containing ``None`` match
+nothing. Pass ``nulls_equal=True`` to treat NULL values on both sides as
+equal. Ordering, ``_limit``/``_offset`` and the ``columns`` projection are
+all applied to the complete result in SQL, so global pagination stays
+correct even when the key list is inserted in many batches::
+
+    rows = table.find_by_keys(
+        key_iter,
+        ['place', 'year'],
+        nulls_equal=True,
+        columns=['place', 'amount'],
+        order_by=['-amount'],
+        _limit=50,
+    )
+    matched = table.count_by_keys(key_iter, ['place', 'year'])
+
+The temporary table lives on the current connection and is dropped before
+the call returns; query errors and outer transaction rollbacks leave no
+temporary state behind, and an outer transaction is never committed by the
+lookup itself.
+
 Queries using raw SQL
 ---------------------
 

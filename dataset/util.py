@@ -11,6 +11,11 @@ from sqlalchemy.engine import Row
 from sqlalchemy.exc import ResourceClosedError
 
 QUERY_STEP = 1000
+# Maximum number of key rows inserted into a temporary table in one batch.
+# Each key row expands into one bind parameter per key column, so keeping the
+# batches small stays below the host variable limits of the supported backends
+# (notably SQLite's default limit of 999 parameters per statement).
+KEY_INSERT_CHUNK_SIZE = 900
 
 # Type definitions for SQL values and rows
 SQLPlainValue = (
@@ -144,6 +149,33 @@ class ResultIter(Iterator[OutRow]):
         if self._conn is not None:
             self._conn.close()
             self._conn = None
+
+
+class KeyedResultIter(ResultIter):
+    """A :class:`ResultIter` over rows already fetched from the database.
+
+    :meth:`Table.find_by_keys` stages the deduplicated key list in a
+    temporary table, runs the whole query (with ordering, limit and offset
+    applied in SQL) and fetches the matched rows before dropping the
+    temporary state. Returning an iterator over the in-memory rows means the
+    temporary table is always gone before the caller starts iterating, so
+    early closes and query errors can never leave state behind, and no cursor
+    referencing the temporary table stays open on backends that lock tables
+    against concurrent DDL on the same connection.
+    """
+
+    @classmethod
+    def from_rows(
+        cls,
+        rows: Iterable[Row[Any]],
+        row_type: RowFactory = row_factory,
+    ) -> "KeyedResultIter":
+        materialised = list(rows)
+        instance = cls(None, row_type=row_type)
+        if materialised:
+            instance.keys = list(materialised[0]._mapping.keys())
+        instance._iter = iter(materialised)
+        return instance
 
 
 def ensure_strings(value: str | Iterable[str] | None) -> list[str]:
