@@ -11,7 +11,7 @@ Database
 --------
 
 .. autoclass:: dataset.Database
-   :members: tables, views, has_table, get_table, create_table, load_table, query, begin, commit, rollback, close
+   :members: tables, views, has_table, get_table, create_table, load_table, query, begin, commit, rollback, savepoint, supports_transactional_ddl, close
    :special-members:
 
 
@@ -29,4 +29,3 @@ Data Export
   **Note:** Data exporting has been extracted into a stand-alone package, datafreeze. See the relevant repository here_.
 
 .. _here: https://github.com/pudo/datafreeze
-

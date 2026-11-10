@@ -1,5 +1,7 @@
 import logging
 import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Any, Literal
 from urllib.parse import parse_qs, urlparse
 
@@ -121,9 +123,22 @@ class Database:
     @property
     def in_transaction(self) -> bool:
         """Check if this database is in a transactional context."""
+        if getattr(self.local, "savepoints", 0) > 0:
+            return True
         if not hasattr(self.local, "tx"):
             return False
         return len(self.local.tx) > 0
+
+    @property
+    def supports_transactional_ddl(self) -> bool:
+        """Whether schema changes can be rolled back with a transaction.
+
+        SQLite and PostgreSQL support transactional DDL, so rolling back
+        a transaction or savepoint also undoes schema changes (e.g. added
+        columns). MySQL/MariaDB implicitly commit around DDL statements,
+        so only data changes are rolled back on those backends.
+        """
+        return self.is_sqlite or self.is_postgres
 
     def _release_connection(self) -> None:
         """Close and release the current thread's connection back to the pool."""
@@ -137,6 +152,7 @@ class Database:
         """Clear the table metadata after transaction rollbacks."""
         for table in self._tables.values():
             table._table = None
+            table._columns = None
 
     def _auto_commit(self) -> None:
         """Commit pending changes when not in an explicit transaction.
@@ -210,6 +226,56 @@ class Database:
                 raise
         else:
             self.rollback()
+
+    @contextmanager
+    def savepoint(self) -> Iterator[None]:
+        """Run a block of statements inside a database SAVEPOINT.
+
+        Unlike nested :py:meth:`begin()` blocks, which share a single
+        transaction, a savepoint can fail independently: if the block
+        raises, only the changes made inside it are rolled back and the
+        outer transaction can continue. On success the savepoint is
+        released without committing the outer transaction. Savepoints
+        can be nested and are released in order.
+
+        The savepoint is bound to the current thread's connection. If
+        that connection has no active transaction, one is started
+        implicitly (SQLAlchemy "autobegin"); if it already has one
+        (explicit or autobegun), the savepoint is created inside it.
+
+        On backends with transactional DDL (see
+        :py:attr:`supports_transactional_ddl`), schema changes made
+        inside the block are rolled back as well, and the reflected
+        table metadata is invalidated so previously obtained
+        :py:class:`Table <dataset.Table>` objects see the real
+        structure again. On backends without transactional DDL (e.g.
+        MySQL), only data changes are rolled back.
+        ::
+
+            with db:
+                db["user"].insert({"name": "John"})
+                try:
+                    with db.savepoint():
+                        db["user"].insert({"name": "Jane", "age": 37})
+                        raise ValueError()
+                except ValueError:
+                    pass
+                db["user"].insert({"name": "Jill"})
+        """
+        nested = self.executable.begin_nested()
+        if not hasattr(self.local, "savepoints"):
+            self.local.savepoints = 0
+        self.local.savepoints += 1
+        try:
+            yield
+        except BaseException:
+            nested.rollback()
+            self._flush_tables()
+            raise
+        else:
+            nested.commit()
+        finally:
+            self.local.savepoints -= 1
 
     def close(self) -> None:
         """Close all database connections and dispose of the engine.

@@ -176,3 +176,65 @@ def test_thread_connections_released():
             f"Expected at most 1 connection, got {len(db.connections)}"
         )
         db.close()
+
+
+def test_savepoint_inner_failure(db):
+    """A failing savepoint rolls back its data and schema changes only."""
+    if not db.supports_transactional_ddl:
+        pytest.skip("Backend cannot roll back DDL (e.g. MySQL)")
+    table = db.create_table("savepoint_test")
+    with db:
+        table.insert({"name": "outer1"})
+        with pytest.raises(ValueError), db.savepoint():
+            # Automatically adds the "extra" column, then fails.
+            table.insert({"name": "inner", "extra": 1})
+            raise ValueError()
+        table.insert({"name": "outer2"})
+    # The outer transaction released its connection on commit.
+    assert len(db.connections) == 0
+    # The outer transaction committed both of its rows.
+    rows = list(table.find())
+    assert sorted(row["name"] for row in rows) == ["outer1", "outer2"]
+    # The savepoint's row and its auto-created column are gone, and the
+    # previously obtained Table object reflects the real structure.
+    assert "extra" not in table.columns
+    assert all("extra" not in row for row in rows)
+
+
+def test_savepoint_inner_success_outer_rollback(db):
+    """A released savepoint is still discarded when the outer rolls back."""
+    table = db.create_table("savepoint_outer_rollback")
+    with pytest.raises(ValueError), db:
+        table.insert({"name": "outer"})
+        with db.savepoint():
+            table.insert({"name": "inner"})
+        raise ValueError()
+    assert table.count() == 0
+
+
+def test_savepoint_without_explicit_transaction(db):
+    """Savepoints work on an autobegin connection outside begin/commit."""
+    table = db.create_table("savepoint_autobegin")
+    table.insert({"name": "before"})
+    # Force an autobegin transaction on the connection via a read.
+    list(table.find())
+    assert db.executable.in_transaction()
+    with pytest.raises(RuntimeError), db.savepoint():
+        table.insert({"name": "discarded"})
+        raise RuntimeError()
+    assert not db.in_transaction
+    table.insert({"name": "after"})
+    names = sorted(row["name"] for row in table.find())
+    assert names == ["after", "before"]
+
+
+def test_savepoint_nested(db):
+    """Nested savepoints release in order without committing the outer."""
+    table = db.create_table("savepoint_nested")
+    with db:
+        with db.savepoint():
+            table.insert({"name": "one"})
+            with db.savepoint():
+                table.insert({"name": "two"})
+        assert db.in_transaction
+    assert table.count() == 2

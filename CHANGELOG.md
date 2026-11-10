@@ -3,6 +3,14 @@
 *The changelog has only been started with version 0.3.12, previous
 changes must be reconstructed from revision history.*
 
+* **Unreleased**
+  - **`Database.savepoint()`**: New context manager for SAVEPOINT-based nested
+    transactions that can fail independently of the outer transaction; rolls
+    back data and (on backends with transactional DDL) schema changes, and
+    invalidates reflected table metadata on rollback
+  - **`Database.supports_transactional_ddl`**: New property documenting whether
+    the backend can roll back DDL (SQLite/PostgreSQL yes, MySQL no)
+
 * **2.0.0**: Major modernization and type annotations
   - **Type annotations**: Full `mypy --strict` compliance across all modules
   - **PEP 561**: Added `py.typed` marker for downstream type checking

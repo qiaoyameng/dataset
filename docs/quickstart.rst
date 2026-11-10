@@ -95,6 +95,29 @@ Nested transactions are supported too::
         with db as tx2:
             tx2['user'].insert(dict(name='Jane Doe', age=37, country='France', gender='female'))
 
+Note that nested ``begin()``/``with db:`` blocks share a single database
+transaction: only the outermost block commits or rolls back. If you need a
+section that can fail independently while the outer transaction continues,
+use a savepoint::
+
+    db = dataset.connect()
+    with db:
+        db['user'].insert(dict(name='John Doe', age=46, country='China'))
+        try:
+            with db.savepoint():
+                db['user'].insert(dict(name='Jane Doe', age=37, country='France'))
+                raise ValueError()
+        except ValueError:
+            pass  # only Jane's insert was rolled back
+        db['user'].insert(dict(name='Jill Doe', age=28, country='Spain'))
+
+On success, a savepoint is released without committing the outer
+transaction. Savepoints also roll back schema changes (such as
+automatically added columns), but only on backends with transactional
+DDL — SQLite and PostgreSQL. On MySQL/MariaDB, DDL statements cause an
+implicit commit, so only data changes are rolled back there (see
+:py:attr:`supports_transactional_ddl <dataset.Database.supports_transactional_ddl>`).
+
 Closing connections
 -------------------
 
