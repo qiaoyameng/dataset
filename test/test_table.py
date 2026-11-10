@@ -5,6 +5,7 @@ from sqlalchemy.exc import ArgumentError
 from sqlalchemy.types import BIGINT, TEXT
 
 from dataset import chunked
+from dataset.util import InsertStreamError
 
 from .conftest import TEST_CITY_1, TEST_DATA
 
@@ -287,6 +288,125 @@ def test_insert_many(table):
     data = TEST_DATA * 100
     table.insert_many(data, chunk_size=13)
     assert len(table) == len(data) + 6, (len(table), len(data))
+
+
+def test_insert_stream_one_pass_source(db):
+    tbl = db["streamed"]
+    consumed = []
+
+    def source():
+        for i in range(7):
+            consumed.append(i)
+            yield {"num": i}
+
+    tbl.insert_stream(source(), chunk_size=3)
+    assert consumed == list(range(7))
+    assert len(tbl) == 7
+    assert [r["num"] for r in tbl.find(order_by="num")] == list(range(7))
+
+
+def test_insert_stream_late_column_gets_null_in_old_rows(db):
+    tbl = db["streamed_late"]
+    rows = [{"a": 1}, {"a": 2}, {"a": 3, "extra": "new"}, {"a": 4, "extra": None}]
+    tbl.insert_stream(iter(rows), chunk_size=2)
+    assert tbl.has_column("extra")
+    by_a = {r["a"]: r for r in tbl.find()}
+    assert by_a[1]["extra"] is None
+    assert by_a[2]["extra"] is None
+    assert by_a[3]["extra"] == "new"
+    assert by_a[4]["extra"] is None
+    # The input rows must not be padded or otherwise modified.
+    assert rows == [
+        {"a": 1},
+        {"a": 2},
+        {"a": 3, "extra": "new"},
+        {"a": 4, "extra": None},
+    ]
+
+
+def test_insert_stream_none_sample_uses_batch_sample(db):
+    tbl = db["streamed_none"]
+    tbl.insert_stream(
+        iter([{"a": 1, "b": None}, {"a": 2, "b": "x"}]), chunk_size=2
+    )
+    assert isinstance(tbl.table.c["b"].type, db.types.text)
+
+
+def test_insert_stream_none_only_column_is_deferred(db):
+    tbl = db["streamed_defer"]
+    tbl.insert_stream(
+        iter([{"a": 1, "b": None}, {"a": 2, "b": None}, {"a": 3, "b": 5}]),
+        chunk_size=2,
+    )
+    # The column is created once a non-None sample shows up, typed by it.
+    assert isinstance(tbl.table.c["b"].type, BIGINT)
+    by_a = {r["a"]: r for r in tbl.find()}
+    assert by_a[1]["b"] is None
+    assert by_a[2]["b"] is None
+    assert by_a[3]["b"] == 5
+
+
+def test_insert_stream_explicit_types(db):
+    tbl = db["streamed_types"]
+    tbl.insert_stream(
+        iter([{"a": 1, "b": None}, {"a": 2, "b": 2}]),
+        chunk_size=2,
+        types={"b": db.types.float},
+    )
+    assert isinstance(tbl.table.c["b"].type, db.types.float)
+
+
+def test_insert_stream_source_error_keeps_committed_batches(db):
+    tbl = db["streamed_source_error"]
+
+    def source():
+        yield {"a": 1}
+        yield {"a": 2}
+        raise RuntimeError("API blew up on page two")
+
+    with pytest.raises(RuntimeError, match="page two"):
+        tbl.insert_stream(source(), chunk_size=2)
+    # The first batch was committed before the source failed.
+    assert len(tbl) == 2
+
+
+def test_insert_stream_bad_batch_rolls_back_atomically(db):
+    tbl = db["streamed_bad_batch"]
+
+    def source():
+        yield {"a": 1}
+        yield {"a": 2}
+        # Final batch: a new column appears, one row has an illegal value.
+        yield {"a": 3, "ts": datetime(2020, 1, 1)}
+        yield {"a": 4, "ts": "not-a-date"}
+
+    with pytest.raises(InsertStreamError) as excinfo:
+        tbl.insert_stream(source(), chunk_size=2)
+    err = excinfo.value
+    assert err.batch == 2
+    assert err.row_start == 2
+    assert err.row_end == 4
+    # Previously committed batches are kept.
+    assert [r["a"] for r in tbl.find(order_by="a")] == [1, 2]
+    # The failed batch's schema change was rolled back with its data, and
+    # the reflection cache agrees with the actual table structure.
+    actual = {c["name"] for c in db.inspect.get_columns(tbl.name)}
+    assert "ts" not in actual
+    assert set(tbl.columns) == actual
+
+
+def test_insert_stream_respects_outer_transaction(db):
+    tbl = db["streamed_tx"]
+    tbl.insert({"a": 0})
+    with pytest.raises(RuntimeError):
+        with db:
+            tbl.insert_stream(iter([{"a": 1}, {"a": 2}, {"a": 3}]), chunk_size=1)
+            raise RuntimeError("caller rolls everything back")
+    assert len(tbl) == 1
+
+    with db:
+        tbl.insert_stream(iter([{"a": 1}, {"a": 2}, {"a": 3}]), chunk_size=1)
+    assert len(tbl) == 4
 
 
 def test_chunked_insert(table):

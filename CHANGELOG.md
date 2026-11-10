@@ -3,6 +3,20 @@
 *The changelog has only been started with version 0.3.12, previous
 changes must be reconstructed from revision history.*
 
+* **Unreleased**
+  - **`Table.insert_stream()`**: New streaming bulk insert for one-pass
+    iterables (e.g. paginated API results). Consumes the source lazily in
+    configurable batches, syncing the schema per batch right before it is
+    written. Each batch (schema changes plus data) is one transaction; a
+    failed batch raises `InsertStreamError` with the batch number and
+    source row range, keeping previously committed batches. Explicit
+    column `types` are supported; new columns seen only as `None` within
+    a batch are deferred instead of being mis-typed. Input rows are never
+    modified.
+  - **SQLite transactional DDL**: SQLite connections now emit an explicit
+    `BEGIN` (per the SQLAlchemy "SQLite Transactional DDL" recipe) instead
+    of relying on pysqlite's legacy implicit transaction control, so schema
+    changes participate in transactions and roll back correctly.
 * **2.0.0**: Major modernization and type annotations
   - **Type annotations**: Full `mypy --strict` compliance across all modules
   - **PEP 561**: Added `py.typed` marker for downstream type checking

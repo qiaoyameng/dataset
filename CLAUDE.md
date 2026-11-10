@@ -43,6 +43,8 @@ dataset/
 ### 3. CRUD Operations
 - **insert()**: Add single row, returns primary key
 - **insert_many()**: Bulk insert with chunking (default: 1000 rows)
+- **insert_stream()**: Streaming bulk insert for one-pass iterables; per-batch
+  schema sync and transactions, raises `InsertStreamError` on batch failure
 - **update()**: Update rows matching keys
 - **upsert()**: Insert or update based on key columns
 - **delete()**: Delete rows matching filters

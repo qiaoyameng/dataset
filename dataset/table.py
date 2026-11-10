@@ -20,6 +20,7 @@ from dataset.types import MYSQL_LENGTH_TYPES, ColumnType, Types
 from dataset.util import (
     QUERY_STEP,
     DatasetError,
+    InsertStreamError,
     MutableRow,
     OutRow,
     QueryError,
@@ -236,6 +237,133 @@ class Table:
                 self.db.executable.execute(self.table.insert(), chunk)
                 self.db._auto_commit()
                 chunk = []
+
+    def insert_stream(
+        self,
+        rows: Iterable[WriteRow],
+        chunk_size: int = 1000,
+        ensure: bool | None = None,
+        types: dict[str, ColumnType] | None = None,
+    ) -> None:
+        """Add rows from a one-pass iterable in transactional batches.
+
+        Unlike :py:meth:`insert_many() <dataset.Table.insert_many>`, the
+        source is consumed lazily: only ``chunk_size`` rows are read at a
+        time, so single-pass iterators (e.g. paginated API responses) are
+        supported. The schema is synced per batch, right before that batch
+        is written — new columns appearing in later batches are created
+        then, leaving ``NULL`` in the rows already written.
+
+        Each batch (schema changes plus data) is written in a single
+        transaction. If a batch fails, it is rolled back and an
+        :py:class:`InsertStreamError <dataset.util.InsertStreamError>` is
+        raised, reporting the batch number and source row range; batches
+        committed earlier are kept. If the caller already opened a
+        transaction (``with db:``), no per-batch commit is issued and the
+        outer transaction stays in control.
+
+        New columns without an explicit entry in ``types`` are typed from
+        the first non-``None`` sample within the current batch. If a batch
+        only contains ``None`` values for a new column, its creation is
+        deferred to a later batch with a usable sample (the ``None`` values
+        are stored as ``NULL`` either way).
+
+        The input rows are never modified.
+        ::
+
+            table.insert_stream(fetch_pages(), chunk_size=500)
+        """
+        if chunk_size < 1:
+            raise ValueError("chunk_size must be at least 1")
+        chunk: list[WriteRow] = []
+        batch_no = 0
+        row_count = 0
+        for row in rows:
+            chunk.append(row)
+            row_count += 1
+            if len(chunk) >= chunk_size:
+                batch_no += 1
+                self._insert_stream_batch(
+                    chunk, batch_no, row_count - len(chunk), ensure, types
+                )
+                chunk = []
+        if len(chunk):
+            batch_no += 1
+            self._insert_stream_batch(
+                chunk, batch_no, row_count - len(chunk), ensure, types
+            )
+
+    def _insert_stream_batch(
+        self,
+        chunk: list[WriteRow],
+        batch_no: int,
+        row_start: int,
+        ensure: bool | None,
+        types: dict[str, ColumnType] | None,
+    ) -> None:
+        """Write one streaming batch (schema sync plus data) atomically."""
+        row_end = row_start + len(chunk)
+        self.db.begin()
+        try:
+            columns = self._sync_stream_columns(
+                chunk, self._check_ensure(ensure), types
+            )
+            insert_rows: list[MutableRow] = []
+            for source_row in chunk:
+                normalized = {
+                    self._get_column_name(key): value
+                    for key, value in source_row.items()
+                }
+                insert_rows.append(
+                    {column: normalized.get(column) for column in columns}
+                )
+            self.db.executable.execute(self.table.insert(), insert_rows)
+        except Exception as exc:
+            self.db.rollback()
+            raise InsertStreamError(batch_no, row_start, row_end) from exc
+        self.db.commit()
+
+    def _sync_stream_columns(
+        self,
+        chunk: list[WriteRow],
+        ensure: bool,
+        types: dict[str, ColumnType] | None,
+    ) -> list[str]:
+        """Create missing columns for one streaming batch.
+
+        Returns the ordered union of column names to insert for this batch.
+        New columns without an explicit type and without a non-``None``
+        sample in this batch are deferred to a later batch instead of being
+        mis-typed from a ``None`` value.
+        """
+        types = types or {}
+        types = {self._get_column_name(k): v for (k, v) in types.items()}
+        order: list[str] = []
+        samples: MutableRow = {}
+        for row in chunk:
+            for key, value in row.items():
+                name = self._get_column_name(key)
+                if name not in samples:
+                    samples[name] = value
+                    order.append(name)
+                elif samples[name] is None and value is not None:
+                    samples[name] = value
+        sync_columns: list[Column[Any]] = []
+        for name in order:
+            if self.has_column(name) or not ensure:
+                continue
+            column_type = types.get(name)
+            if column_type is None:
+                sample = samples[name]
+                if sample is None:
+                    log.info(
+                        "Deferring column %r: no non-NULL sample in batch.", name
+                    )
+                    continue
+                column_type = self.db.types.guess(sample)
+            sync_columns.append(Column(name, column_type))
+        self._sync_table(sync_columns)
+        return [name for name in order if self.has_column(name)]
 
     def update(
         self,

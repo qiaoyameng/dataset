@@ -19,7 +19,7 @@ Table
 -----
 
 .. autoclass:: dataset.Table
-   :members: exists, columns, find, find_one, all, count, distinct, insert, insert_ignore, insert_many, update, update_many, upsert, upsert_many, delete, create_column, create_column_by_example, drop_column, create_index, drop, has_column, has_index
+   :members: exists, columns, find, find_one, all, count, distinct, insert, insert_ignore, insert_many, insert_stream, update, update_many, upsert, upsert_many, delete, create_column, create_column_by_example, drop_column, create_index, drop, has_column, has_index
    :special-members: __len__, __iter__
 
 

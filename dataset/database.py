@@ -79,6 +79,28 @@ class Database:
             # we only enable WAL mode for sqlite databases that are not in-memory
             on_connect_statements.append("PRAGMA journal_mode=WAL")
 
+        if self.is_sqlite:
+            # Take over transaction control from pysqlite so that DDL
+            # statements are transactional, like on other databases. In its
+            # default "legacy" mode, pysqlite only begins transactions
+            # implicitly before DML, which silently auto-commits DDL such as
+            # ALTER TABLE. This is the recipe recommended by the SQLAlchemy
+            # documentation (see "SQLite Transactional DDL").
+            @event.listens_for(self.engine, "connect")
+            def _sqlite_disable_implicit_begin(
+                dbapi_con: Any, con_record: Any
+            ) -> None:
+                dbapi_con.isolation_level = None
+
+            @event.listens_for(self.engine, "begin")
+            def _sqlite_emit_begin(conn: Connection) -> None:
+                # Several SQLAlchemy connections may share one SQLite driver
+                # connection (e.g. a streamed read next to a write on an
+                # in-memory database); only BEGIN if none is active yet.
+                if conn.connection.driver_connection.in_transaction:
+                    return
+                conn.exec_driver_sql("BEGIN")
+
         if len(on_connect_statements):
             event.listen(self.engine, "connect", _run_on_connect)
 

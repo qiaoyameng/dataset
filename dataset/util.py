@@ -52,6 +52,24 @@ class QueryError(DatasetError):
     pass
 
 
+class InsertStreamError(DatasetError):
+    """A batch of a streaming insert failed and was rolled back.
+
+    Carries the 1-based ``batch`` number and the half-open range of source
+    row offsets [``row_start``, ``row_end``) that made up the failed batch.
+    Batches committed before the failure remain in the database.
+    """
+
+    def __init__(self, batch: int, row_start: int, row_end: int) -> None:
+        self.batch = batch
+        self.row_start = row_start
+        self.row_end = row_end
+        super().__init__(
+            f"Streaming insert failed at batch {batch} "
+            f"(source rows [{row_start}, {row_end}))"
+        )
+
+
 def iter_result_proxy(
     rp: ResultProxy[Any], step: int | None = None
 ) -> Iterator[Row[Any]]:
