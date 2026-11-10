@@ -3,6 +3,24 @@
 *The changelog has only been started with version 0.3.12, previous
 changes must be reconstructed from revision history.*
 
+* **Unreleased**: Optional SQLite FTS5 full-text search
+  - **`Table.enable_fts`**: Create an FTS5 external-content index over
+    caller-specified text columns and a stable integer row identity;
+    existing rows are backfilled on first use
+  - **Transactional sync**: Insert/update/delete maintain the index via
+    triggers inside the same database transaction, including rollback
+  - **`Table.search`**: MATCH queries returning the original rows, `rank`
+    and an optional `snippet`, combinable with regular field filters and
+    `_limit`; MATCH expressions are bound parameters while identifiers are
+    quoted separately
+  - **Rebuild plans**: `plan_fts_rebuild()` returns an inspectable plan
+    when indexed columns change; failed builds roll back fully and never
+    leave a half-backfilled usable index
+  - **Schema coordination**: `rename()` and `drop()` reconcile the index,
+    triggers and reflection cache
+  - **Capability errors**: SQLite builds without FTS5 raise
+    `FTSCapabilityError`; invalid configurations raise `FTSConfigError`
+
 * **2.0.0**: Major modernization and type annotations
   - **Type annotations**: Full `mypy --strict` compliance across all modules
   - **PEP 561**: Added `py.typed` marker for downstream type checking

@@ -8,7 +8,7 @@ from sqlalchemy import false, func, select
 from sqlalchemy.exc import NoSuchTableError
 from sqlalchemy.schema import Column, Index
 from sqlalchemy.schema import Table as SQLATable
-from sqlalchemy.sql import and_, expression
+from sqlalchemy.sql import and_, expression, text
 from sqlalchemy.sql.expression import (
     ClauseElement,
     ColumnElement,
@@ -16,6 +16,14 @@ from sqlalchemy.sql.expression import (
     bindparam,
 )
 
+from dataset.fts import (
+    FTSConfig,
+    FTSConfigError,
+    FTSManager,
+    FTSRebuildPlan,
+    fts_table_name,
+    quote_identifier,
+)
 from dataset.types import MYSQL_LENGTH_TYPES, ColumnType, Types
 from dataset.util import (
     QUERY_STEP,
@@ -70,6 +78,7 @@ class Table:
             primary_increment = self._primary_type in (Types.integer, Types.bigint)
         self._primary_increment = primary_increment
         self._auto_create = auto_create
+        self.fts = FTSManager(self)
 
     @property
     def exists(self) -> bool:
@@ -648,11 +657,83 @@ class Table:
         with self.db.lock:
             if self.exists:
                 self._threading_warn()
-                self.table.drop(self.db.executable, checkfirst=True)
+                fts_config = self.fts_config()
+                savepoint = self.db.executable.begin_nested()
+                try:
+                    if fts_config is not None:
+                        self.fts._drop_artifacts(self.name)
+                        self.fts._delete_config()
+                    self.table.drop(self.db.executable, checkfirst=True)
+                    savepoint.commit()
+                except Exception:
+                    savepoint.rollback()
+                    raise
                 self._table = None
                 self._columns = None
+                self._indexes = []
                 self.db._tables.pop(self.name, None)
                 self.db._auto_commit()
+
+    def rename(self, new_name: str) -> "Table":
+        """Rename the table and re-attach its FTS5 index, if any.
+
+        SQLite's ``ALTER TABLE RENAME`` rewrites trigger statements but does
+        not update the ``content=`` reference inside an FTS5 external-content
+        table, which would silently break index maintenance. The FTS index
+        and its triggers are therefore dropped before the rename and rebuilt
+        (including a full backfill) afterwards, all inside one savepoint.
+        Returns the :class:`Table` bound to the new name.
+        """
+        new_name = normalize_table_name(new_name)
+        with self.db.lock:
+            if not self.exists:
+                raise DatasetError("Table has not been created yet.")
+            if new_name == self.name:
+                return self
+            if self.db.has_table(new_name):
+                raise DatasetError(f"Table already exists: {new_name}")
+            fts_config = self.fts_config()
+            old_name = self.name
+            savepoint = self.db.executable.begin_nested()
+            try:
+                self._threading_warn()
+                if fts_config is not None:
+                    self.fts._drop_artifacts(self.name)
+                    self.fts._delete_config()
+                self.db.executable.execute(
+                    text(f"ALTER TABLE {quote_identifier(self.name)} "
+                         f"RENAME TO {quote_identifier(new_name)}")
+                )
+                self.name = new_name
+                self._table = None
+                self._columns = None
+                self._indexes = []
+                self.db._tables.pop(old_name, None)
+                self.db._tables[new_name] = self
+                if fts_config is not None:
+                    rebuilt = FTSConfig(
+                        table=new_name,
+                        rowid_column=fts_config.rowid_column,
+                        columns=fts_config.columns,
+                        tokenize=fts_config.tokenize,
+                    )
+                    self.fts._drop_artifacts(new_name)
+                    self.fts._create_virtual_table(rebuilt)
+                    self.fts._create_triggers(rebuilt)
+                    self.fts._backfill(rebuilt)
+                    self.fts._store_config(rebuilt)
+                savepoint.commit()
+            except Exception:
+                savepoint.rollback()
+                self.name = old_name
+                self._table = None
+                self._columns = None
+                self._indexes = []
+                self.db._tables.pop(new_name, None)
+                self.db._tables[old_name] = self
+                raise
+            self.db._auto_commit()
+            return self
 
     def has_index(self, columns: Iterable[str]) -> bool:
         """Check if an index exists to cover the given ``columns``."""
@@ -714,6 +795,183 @@ class Table:
                 idx = Index(name, *columns_, **kw)  # type: ignore[arg-type]
                 idx.create(self.db.executable)
                 self.db._auto_commit()
+
+    # -- full-text search (SQLite FTS5) ----------------------------------
+
+    def fts_config(self) -> FTSConfig | None:
+        """Return the active FTS5 configuration of this table, if any."""
+        return self.fts.get_config()
+
+    def has_fts(self) -> bool:
+        """Check whether an FTS5 index is currently enabled."""
+        return self.fts_config() is not None
+
+    def enable_fts(
+        self,
+        columns: Sequence[str],
+        rowid_column: str = "id",
+        tokenize: str = "unicode61",
+        rebuild: bool = False,
+    ) -> FTSConfig:
+        """Enable an FTS5 full-text index over the given text columns.
+
+        ``rowid_column`` is the stable row identity (an integer primary key
+        column) used as the FTS5 ``rowid``. On first use, existing rows are
+        backfilled; afterwards triggers maintain the index from within the
+        same database transaction as every insert, update and delete.
+
+        Enabling the same configuration twice is a no-op. If an index with a
+        different configuration exists, an :class:`FTSConfigError` carrying
+        an inspectable rebuild plan is raised unless ``rebuild`` is set, in
+        which case the index is rebuilt atomically.
+        ::
+
+            table.enable_fts(['title', 'body'], rowid_column='id')
+            for row in table.search('banana OR apple'):
+                print(row['rank'], row['title'])
+        """
+        if not self.exists:
+            raise DatasetError("Table has not been created yet.")
+        config = self.fts.build_config(
+            list(ensure_strings(columns)), rowid_column, tokenize=tokenize
+        )
+        current = self.fts_config()
+        if current is not None:
+            if current == config:
+                return current
+            if not rebuild:
+                plan = self.fts.plan_rebuild(config)
+                raise FTSConfigError(
+                    "An FTS index with a different configuration already "
+                    f"exists. Inspect the plan via plan_fts_rebuild(): "
+                    f"{plan.describe()}"
+                )
+        self.fts.create(config)
+        return config
+
+    def plan_fts_rebuild(
+        self,
+        columns: Sequence[str],
+        rowid_column: str = "id",
+        tokenize: str = "unicode61",
+    ) -> FTSRebuildPlan:
+        """Build an inspectable rebuild plan without touching the database.
+
+        The plan compares the requested configuration with the one currently
+        persisted and describes the steps a rebuild would perform. Apply it
+        with :meth:`rebuild_fts` (or :meth:`enable_fts` with
+        ``rebuild=True``).
+        """
+        if not self.exists:
+            raise DatasetError("Table has not been created yet.")
+        config = self.fts.build_config(
+            list(ensure_strings(columns)), rowid_column, tokenize=tokenize
+        )
+        return self.fts.plan_rebuild(config)
+
+    def rebuild_fts(
+        self,
+        columns: Sequence[str],
+        rowid_column: str = "id",
+        tokenize: str = "unicode61",
+    ) -> FTSConfig:
+        """Atomically replace the FTS5 index with a new configuration."""
+        if not self.exists:
+            raise DatasetError("Table has not been created yet.")
+        config = self.fts.build_config(
+            list(ensure_strings(columns)), rowid_column, tokenize=tokenize
+        )
+        self.fts.rebuild(config)
+        return config
+
+    def disable_fts(self) -> None:
+        """Drop the FTS5 index, its triggers and the stored configuration."""
+        if self.fts_config() is None:
+            return
+        self.fts.drop()
+
+    def search(
+        self,
+        match: str,
+        *_clauses: ColumnElement[bool],
+        snippet: bool | str = False,
+        _limit: int | None = None,
+        **kwargs: SQLWriteValue,
+    ) -> ResultIter:
+        """Run an FTS5 MATCH query and return the original table rows.
+
+        ``match`` is the FTS5 MATCH expression, always passed as a bound
+        parameter (never string-interpolated). Table and column identifiers
+        are quoted internally. Each result row contains the table's columns
+        plus ``rank``; pass ``snippet=True`` (or an indexed column name) to
+        also include a ``snippet`` string.
+
+        Ordinary field filters can be combined just like with
+        :meth:`find`, as keyword arguments or SQLAlchemy clauses, and
+        ``_limit`` restricts the number of results.
+        ::
+
+            table.search('banana', country='France', _limit=10)
+        """
+        config = self.fts_config()
+        if config is None:
+            raise FTSConfigError(
+                f"Table {self.name!r} has no FTS index; call enable_fts() first."
+            )
+        if self.db.engine is None:
+            raise RuntimeError("Cannot run queries when no engine is available.")
+
+        fts_q = quote_identifier(fts_table_name(config.table))
+        table_q = quote_identifier(config.table)
+
+        filter_clause = self._args_to_clause(kwargs, clauses=_clauses)
+        compiled_filter = filter_clause.compile(
+            self.db.engine, compile_kwargs={"literal_binds": True}
+        )
+        filter_sql = str(compiled_filter)
+
+        select_parts = [f"{table_q}.*", f"{fts_q}.rank AS rank"]
+        params: dict[str, Any] = {"fts_match": match}
+        if snippet:
+            snippet_column = (
+                None if snippet is True else self._get_column_name(str(snippet))
+            )
+            if snippet_column is not None:
+                if snippet_column not in config.columns:
+                    raise FTSConfigError(
+                        f"Column {snippet_column!r} is not part of the FTS index."
+                    )
+                snippet_index = config.columns.index(snippet_column)
+                params["snippet_column"] = snippet_index
+            else:
+                params["snippet_column"] = -1
+            params.update(
+                {
+                    "snippet_start": "<b>",
+                    "snippet_end": "</b>",
+                    "snippet_ellipsis": " ... ",
+                    "snippet_tokens": 12,
+                }
+            )
+            select_parts.append(
+                "snippet("
+                f"{fts_q}, :snippet_column, :snippet_start, :snippet_end, "
+                ":snippet_ellipsis, :snippet_tokens) AS snippet"
+            )
+
+        sql = (
+            f"SELECT {', '.join(select_parts)} FROM {fts_q} "
+            f"JOIN {table_q} ON {table_q}.{quote_identifier(config.rowid_column)} "
+            f"= {fts_q}.rowid WHERE {fts_q} MATCH :fts_match"
+        )
+        if filter_sql != "":
+            sql += f" AND {filter_sql}"
+        sql += f" ORDER BY {fts_q}.rank"
+        if _limit is not None:
+            sql += " LIMIT :fts_limit"
+            params["fts_limit"] = _limit
+        rp = self.db.executable.execute(text(sql), params)
+        return ResultIter(rp, row_type=self.db.row_type)
 
     def find(
         self,

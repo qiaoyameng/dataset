@@ -3,6 +3,12 @@ import warnings
 from typing import Any
 
 from dataset.database import Database
+from dataset.fts import (
+    FTSCapabilityError,
+    FTSConfig,
+    FTSConfigError,
+    FTSRebuildPlan,
+)
 from dataset.table import Table
 from dataset.util import DatasetError, OutRow, QueryError, RowFactory, row_factory
 
@@ -15,6 +21,10 @@ warnings.filterwarnings(
 __all__ = [
     "Database",
     "DatasetError",
+    "FTSCapabilityError",
+    "FTSConfig",
+    "FTSConfigError",
+    "FTSRebuildPlan",
     "OutRow",
     "QueryError",
     "RowFactory",
