@@ -3,6 +3,24 @@
 *The changelog has only been started with version 0.3.12, previous
 changes must be reconstructed from revision history.*
 
+* **Unreleased**: SQLite native bulk upsert
+  - **`upsert_many(..., bulk=True)`**: New SQLite-only batched path based on
+    `INSERT ... ON CONFLICT DO UPDATE`, keeping the row-by-row loop as the
+    default compatibility baseline (`bulk=False`)
+  - **Sparse rows**: Columns missing from a row keep their stored value on
+    update, while an explicit `None` writes SQL `NULL`; missing fields never
+    clear columns the way padding all rows would
+  - **Composite keys**: Every key column must be present and non-`NULL`;
+    duplicate keys inside one batch are applied in input order with
+    forward merging so later rows never undo earlier column updates
+  - **Schema safety**: Missing columns/tables are still created lazily; a
+    covering `PRIMARY KEY`/`UNIQUE` constraint is required, created
+    automatically when `ensure` allows it, otherwise a clear `DatasetError`
+    is raised before any write
+  - **Atomicity and limits**: Each batch fully commits or rolls back, and
+    batches exceeding SQLite's host-parameter limit are split without
+    changing semantics
+* **2.0.0**: Major modernization and type annotations
 * **2.0.0**: Major modernization and type annotations
   - **Type annotations**: Full `mypy --strict` compliance across all modules
   - **PEP 561**: Added `py.typed` marker for downstream type checking

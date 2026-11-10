@@ -1,10 +1,14 @@
+import copy
 from datetime import datetime
 
 import pytest
+import sqlalchemy
 from sqlalchemy.exc import ArgumentError
 from sqlalchemy.types import BIGINT, TEXT
 
+import dataset
 from dataset import chunked
+from dataset.util import DatasetError
 
 from .conftest import TEST_CITY_1, TEST_DATA
 
@@ -352,6 +356,300 @@ def test_upsert_many(db):
 
     tbl.upsert_many([{"id": 1, "age": 70}, {"id": 2, "weight": weight / 2}], "id")
     assert tbl.find_one(id=2)["weight"] == weight / 2
+
+
+def _bulk_rows():
+    # Sparse rows, explicit NULLs and a composite key repeated in input order.
+    return [
+        {"a": 1, "b": 10, "c": "x"},
+        {"a": 2, "b": 20, "c": "y", "d": 1.5},
+        {"a": 1, "b": 10, "c": None},
+        {"a": 1, "b": 10, "d": 2.5},
+        {"a": 2, "b": 20},
+        {"a": 3, "b": 30, "c": "z", "d": None},
+        {"a": 2, "b": 20, "c": "y2", "d": 9.9},
+        {"a": 3, "b": 30, "d": 7.7},
+    ]
+
+
+def _table_snapshot(tbl):
+    return sorted(
+        (dict(row) for row in tbl.find()),
+        key=lambda row: tuple(sorted(row.items(), key=str)),
+    )
+
+
+def _count_cursor_execs(engine):
+    events = []
+
+    def listener(conn, cursor, statement, parameters, context, executemany):
+        events.append((statement, executemany))
+
+    sqlalchemy.event.listen(engine, "before_cursor_execute", listener)
+    return events
+
+
+def test_bulk_upsert_matches_row_by_row(db):
+    if not db.is_sqlite:
+        pytest.skip("bulk upsert is SQLite-only")
+    rows = _bulk_rows()
+
+    reference = dataset.connect()
+    reference["parity"].upsert_many(copy.deepcopy(rows), ["a", "b"])
+    expected = _table_snapshot(reference["parity"])
+
+    tbl = db["parity_bulk"]
+    tbl.upsert_many(copy.deepcopy(rows), ["a", "b"], bulk=True)
+    assert _table_snapshot(tbl) == expected
+
+    # Explicit NULL was written, missing columns kept their values, and the
+    # repeated composite key was applied in input order without undoing prior
+    # column updates.
+    first = tbl.find_one(a=1, b=10)
+    assert first["c"] is None
+    assert first["d"] == 2.5
+    second = tbl.find_one(a=2, b=20)
+    assert second["c"] == "y2"
+    assert second["d"] == 9.9
+    third = tbl.find_one(a=3, b=30)
+    assert third["c"] == "z"
+    assert third["d"] == 7.7
+    assert len(tbl) == 3
+    reference.close()
+
+
+def test_bulk_upsert_does_not_mutate_input(db):
+    if not db.is_sqlite:
+        pytest.skip("bulk upsert is SQLite-only")
+    tbl = db["bulk_immutable_input"]
+    rows = _bulk_rows()
+    saved = copy.deepcopy(rows)
+    tbl.upsert_many(rows, ["a", "b"], bulk=True)
+    assert rows == saved
+
+
+def test_bulk_upsert_uses_fewer_sql_statements(db):
+    if not db.is_sqlite:
+        pytest.skip("bulk upsert is SQLite-only")
+    rows = [
+        {"a": i, "b": i * 2, "c": None if i % 4 == 0 else f"v{i}"}
+        for i in range(30)
+    ]
+
+    reference = dataset.connect()
+    ref_events = _count_cursor_execs(reference.engine)
+    reference["slow"].upsert_many(copy.deepcopy(rows), ["a", "b"])
+    ref_dml = [
+        event for event in ref_events if event[0].lstrip("(").split()[0].upper()
+        in ("INSERT", "UPDATE")
+    ]
+
+    tbl = db["fast"]
+    bulk_events = _count_cursor_execs(db.engine)
+    tbl.upsert_many(copy.deepcopy(rows), ["a", "b"], bulk=True)
+    bulk_dml = [
+        event
+        for event in bulk_events
+        if event[0].lstrip("(").split()[0].upper() in ("INSERT", "UPDATE")
+    ]
+
+    # Row-by-row needs an UPDATE plus an INSERT attempt per row; the bulk
+    # path collapses the whole batch into one executemany statement.
+    assert len(bulk_dml) == 1
+    assert bulk_dml[0][1] is True
+    assert len(bulk_dml) < len(ref_dml)
+    assert len(ref_dml) == 2 * len(rows)
+    reference.close()
+
+
+def test_bulk_upsert_missing_or_null_key_errors_upfront(db):
+    if not db.is_sqlite:
+        pytest.skip("bulk upsert is SQLite-only")
+    tbl = db["bulk_key_errors"]
+    tbl.insert({"a": 1, "b": 1, "c": "seed"})
+
+    with pytest.raises(DatasetError, match="missing key column"):
+        tbl.upsert_many([{"a": 1, "c": "x"}], ["a", "b"], bulk=True)
+    with pytest.raises(DatasetError, match="NULL value for key"):
+        tbl.upsert_many(
+            [{"a": 1, "b": None, "c": "x"}], ["a", "b"], bulk=True
+        )
+    # Nothing was written and no column was created by the failed batch.
+    assert tbl.find_one(a=1, b=1)["c"] == "seed"
+    assert "c" in tbl.columns
+    assert tbl.count() == 1
+
+
+def test_bulk_upsert_requires_unique_constraint(db):
+    if not db.is_sqlite:
+        pytest.skip("bulk upsert is SQLite-only")
+    tbl = db["bulk_no_constraint"]
+    tbl.insert({"a": 1, "b": 1, "c": "v"})
+    with pytest.raises(DatasetError, match="UNIQUE constraint"):
+        tbl.upsert_many(
+            [{"a": 1, "b": 1, "c": "w"}],
+            ["a", "b"],
+            bulk=True,
+            ensure=False,
+        )
+    assert tbl.find_one(a=1, b=1)["c"] == "v"
+
+    # With schema changes allowed, a unique index is created and the upsert
+    # then goes through.
+    tbl.upsert_many([{"a": 1, "b": 1, "c": "w"}], ["a", "b"], bulk=True)
+    assert tbl.find_one(a=1, b=1)["c"] == "w"
+
+
+def test_bulk_upsert_rejects_non_unique_existing_rows(db):
+    if not db.is_sqlite:
+        pytest.skip("bulk upsert is SQLite-only")
+    tbl = db["bulk_duplicate_data"]
+    tbl.insert_many([{"a": 1, "b": 1}, {"a": 1, "b": 1}])
+    with pytest.raises(DatasetError, match="not unique"):
+        tbl.upsert_many(
+            [{"a": 1, "b": 1, "c": "x"}], ["a", "b"], bulk=True
+        )
+    assert tbl.count() == 2
+
+
+def test_bulk_upsert_is_atomic(db):
+    if not db.is_sqlite:
+        pytest.skip("bulk upsert is SQLite-only")
+    tbl = db["bulk_atomic"]
+    tbl.insert({"a": 1, "b": 1, "c": "old"})
+    tbl.create_index(["a", "b"], name="uab", unique=True)
+    tbl.create_column("e", db.types.text)
+    tbl.create_index(["e"], name="ue", unique=True)
+    tbl.update({"a": 1, "b": 1, "e": "dup"}, ["a", "b"])
+
+    rows = [
+        {"a": 1, "b": 1, "c": "new"},
+        {"a": 9, "b": 9, "e": "dup"},
+        {"a": 10, "b": 10, "e": "dup"},
+    ]
+    with pytest.raises(DatasetError, match="rolled back"):
+        tbl.upsert_many(rows, ["a", "b"], bulk=True)
+
+    assert tbl.find_one(a=1, b=1)["c"] == "old"
+    assert tbl.count(a=9) == 0
+    assert tbl.count(a=10) == 0
+
+
+def test_bulk_upsert_splits_on_sqlite_variable_limit(db):
+    if not db.is_sqlite:
+        pytest.skip("bulk upsert is SQLite-only")
+    tbl = db["bulk_split"]
+    tbl.SQLITE_FALLBACK_VARIABLE_LIMIT = 200
+    data_columns = [f"col{i}" for i in range(30)]
+    rows = []
+    for row_index in range(40):
+        row = {"a": row_index, "b": row_index * 2}
+        for col_index, column in enumerate(data_columns):
+            if (row_index + col_index) % 3:
+                row[column] = (
+                    None if (row_index + col_index) % 7 == 0
+                    else f"{row_index}-{col_index}"
+                )
+        rows.append(row)
+
+    tbl.upsert_many(rows, ["a", "b"], bulk=True, chunk_size=1000)
+    # Re-applying the same batch must not create duplicates and must keep
+    # every value stable, proving chunk splits preserve semantics.
+    tbl.upsert_many(copy.deepcopy(rows), ["a", "b"], bulk=True, chunk_size=1000)
+    assert len(tbl) == 40
+    sample = tbl.find_one(a=7)
+    for column in data_columns:
+        if column in rows[7]:
+            assert sample[column] == rows[7][column]
+        else:
+            assert sample[column] is None
+
+
+def test_bulk_upsert_respects_chunk_size(db):
+    if not db.is_sqlite:
+        pytest.skip("bulk upsert is SQLite-only")
+    tbl = db["bulk_chunks"]
+    events = _count_cursor_execs(db.engine)
+    rows = [{"a": i, "b": i, "c": i} for i in range(25)]
+    tbl.upsert_many(rows, ["a", "b"], bulk=True, chunk_size=10)
+    dml = [
+        event
+        for event in events
+        if event[0].lstrip("(").split()[0].upper() in ("INSERT", "UPDATE")
+    ]
+    assert len(dml) == 3
+    assert all(event[1] for event in dml)
+    assert len(tbl) == 25
+
+
+def test_bulk_upsert_unsupported_backend(db):
+    if db.is_sqlite:
+        # Pretend to be another backend; the guard must not depend on actual
+        # driver behavior beyond this flag.
+        db.is_sqlite = False
+    tbl = db["bulk_unsupported"]
+    with pytest.raises(DatasetError, match="only supported on SQLite"):
+        tbl.upsert_many([{"a": 1}], ["a"], bulk=True)
+
+
+def test_bulk_upsert_key_only_rows_do_nothing_on_conflict(db):
+    if not db.is_sqlite:
+        pytest.skip("bulk upsert is SQLite-only")
+    tbl = db["bulk_key_only"]
+    tbl.insert({"k": 1, "v": "keep"})
+    tbl.create_index(["k"], unique=True)
+    # No data columns: a conflicting row must leave the stored value alone.
+    tbl.upsert_many([{"k": 1}, {"k": 2}], ["k"], bulk=True)
+    assert tbl.find_one(k=1)["v"] == "keep"
+    assert tbl.find_one(k=2)["v"] is None
+    assert len(tbl) == 2
+
+
+def test_bulk_upsert_cased_column_names(db):
+    if not db.is_sqlite:
+        pytest.skip("bulk upsert is SQLite-only")
+    tbl = db["bulk_cased"]
+    tbl.upsert_many(
+        [{"Place": "Berlin", "n": 1}, {"place": "Berlin", "n": 2}],
+        ["Place"],
+        bulk=True,
+    )
+    assert len(tbl) == 1
+    row = tbl.find_one()
+    assert row["n"] == 2
+    assert "Place" in row
+
+
+def test_bulk_upsert_rolls_back_inside_explicit_transaction(db):
+    if not db.is_sqlite:
+        pytest.skip("bulk upsert is SQLite-only")
+    tbl = db["bulk_txn_rollback"]
+    with db:
+        tbl.upsert_many([{"k": 1, "v": "a"}], ["k"], bulk=True)
+        db.rollback()
+    assert tbl.count() == 0
+
+
+def test_bulk_upsert_honors_types_override(db):
+    if not db.is_sqlite:
+        pytest.skip("bulk upsert is SQLite-only")
+    tbl = db["bulk_types"]
+    tbl.upsert_many(
+        [{"k": 1, "note": 5}],
+        ["k"],
+        bulk=True,
+        types={"note": db.types.text},
+    )
+    # Without the override the integer sample would yield BigInteger.
+    assert tbl.table.c["note"].type.__class__.__name__ in ("TEXT", "UnicodeText")
+
+
+def test_bulk_upsert_rejects_non_positive_chunk_size(db):
+    if not db.is_sqlite:
+        pytest.skip("bulk upsert is SQLite-only")
+    tbl = db["bulk_bad_chunk"]
+    with pytest.raises(DatasetError, match="chunk_size"):
+        tbl.upsert_many([{"k": 1}], ["k"], bulk=True, chunk_size=0)
 
 
 def test_drop_operations(table):

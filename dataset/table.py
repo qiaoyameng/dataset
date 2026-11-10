@@ -1,11 +1,13 @@
 import logging
+import sqlite3
 import threading
 import warnings
 from collections.abc import Iterable, Sequence
 from typing import TYPE_CHECKING, Any, Literal
 
-from sqlalchemy import false, func, select
-from sqlalchemy.exc import NoSuchTableError
+from sqlalchemy import case, false, func, select
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.exc import IntegrityError, NoSuchTableError, OperationalError
 from sqlalchemy.schema import Column, Index
 from sqlalchemy.schema import Table as SQLATable
 from sqlalchemy.sql import and_, expression
@@ -15,6 +17,7 @@ from sqlalchemy.sql.expression import (
     UnaryExpression,
     bindparam,
 )
+from sqlalchemy.sql.dml import Insert as SqlInsert
 
 from dataset.types import MYSQL_LENGTH_TYPES, ColumnType, Types
 from dataset.util import (
@@ -351,6 +354,7 @@ class Table:
         chunk_size: int = 1000,
         ensure: bool | None = None,
         types: dict[str, ColumnType] | None = None,
+        bulk: bool = False,
     ) -> None:
         """
         Sorts multiple input rows into upserts and inserts. Inserts are passed
@@ -358,11 +362,360 @@ class Table:
 
         See :py:meth:`upsert() <dataset.Table.upsert>` and
         :py:meth:`insert_many() <dataset.Table.insert_many>`.
+
+        On SQLite, ``bulk=True`` selects a native batched path built on
+        ``INSERT ... ON CONFLICT DO UPDATE``. It preserves the row-by-row
+        semantics while issuing far fewer SQL statements:
+
+        * every key column must be present on each input row and must not be
+          ``None``, otherwise a :class:`~dataset.util.DatasetError` is raised
+          before any write happens;
+        * a column missing from a row keeps its existing value on update,
+          while an explicit ``None`` writes SQL ``NULL``;
+        * if the same key occurs more than once in ``rows``, the rows are
+          applied in input order, and a later row never undoes a column set
+          by an earlier row;
+        * a unique constraint (or primary key) covering the key columns must
+          exist. If it does not and ``ensure`` allows schema changes, a unique
+          index is created; otherwise a clear :class:`~dataset.util.DatasetError`
+          is raised up front;
+        * the whole batch is atomic: either every row takes effect or the
+          table is left untouched;
+        * batches exceeding SQLite's host-parameter limit are split into
+          smaller chunks without changing the result.
+
+        On other backends, or when ``bulk`` is ``False``, the established
+        row-by-row :py:meth:`upsert() <dataset.Table.upsert>` loop is used as
+        the compatibility baseline.
         """
-        # Removing a bulk implementation in 5e09aba401. Doing this one by one
-        # is incredibly slow, but doesn't run into issues with column creation.
+        if not bulk:
+            # Removing a bulk implementation in 5e09aba401. Doing this one by
+            # one is incredibly slow, but doesn't run into issues with column
+            # creation. It stays available as the compatibility baseline.
+            for row in rows:
+                self.upsert(row, keys, ensure=ensure, types=types)
+            return
+        if not self.db.is_sqlite:
+            raise DatasetError(
+                "Bulk upsert is only supported on SQLite. Use bulk=False "
+                "for the portable row-by-row implementation."
+            )
+        self._sqlite_upsert_many(rows, keys, chunk_size, ensure, types)
+
+    # Host-parameter limit used when the sqlite3 module does not expose a
+    # runtime ``sqlite_limit()`` query (Python 3.10 and older builds).
+    SQLITE_FALLBACK_VARIABLE_LIMIT = 999
+
+    def _sqlite_variable_limit(self) -> int:
+        """Return SQLite's SQLITE_LIMIT_VARIABLE_NUMBER for the connection."""
+        dbapi_connection = self.db.executable.connection
+        sqlite_limit = getattr(dbapi_connection, "sqlite_limit", None)
+        if sqlite_limit is not None:
+            try:
+                limit = sqlite_limit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER)
+            except (AttributeError, TypeError):
+                limit = None
+            if isinstance(limit, int) and limit > 0:
+                return limit
+        return self.SQLITE_FALLBACK_VARIABLE_LIMIT
+
+    def _validate_upsert_key_values(
+        self, rows: Sequence[WriteRow], key_names: Sequence[str]
+    ) -> None:
+        """Make sure every row carries a complete, non-NULL composite key.
+
+        This only inspects the input objects and therefore runs before any
+        schema change, so malformed batches cannot create tables or columns.
+        """
+        normalized_keys = [normalize_column_key(key) for key in key_names]
+        for index, row in enumerate(rows):
+            lookup: dict[str, str] = {}
+            for name in row:
+                column_key = normalize_column_key(name)
+                if column_key is not None:
+                    lookup[column_key] = name
+            for key, key_key in zip(key_names, normalized_keys):
+                if key_key is None:
+                    raise DatasetError(f"{key!r} is not a valid key column.")
+                actual = lookup.get(key_key)
+                if actual is None:
+                    raise DatasetError(
+                        f"upsert_many row {index} is missing key column "
+                        f"{key!r}; all key columns must be provided."
+                    )
+                if row[actual] is None:
+                    raise DatasetError(
+                        f"upsert_many row {index} has NULL value for key "
+                        f"column {key!r}; key columns must not be NULL."
+                    )
+
+    def _validate_upsert_key_columns(
+        self, key_names: Sequence[str], column_keys: dict[str, str]
+    ) -> None:
+        """Ensure the composite key columns exist on the table after sync."""
+        missing = [
+            key
+            for key in key_names
+            if normalize_column_key(key) not in column_keys
+        ]
+        if missing:
+            raise DatasetError(
+                f"Cannot bulk upsert: key column(s) {missing!r} do not exist "
+                "on the table and could not be created."
+            )
+
+    def _resolve_conflict_target(
+        self, key_names: Sequence[str], ensure: bool | None
+    ) -> list[str]:
+        """Find the PRIMARY KEY/UNIQUE constraint that makes keys unique.
+
+        Returns the constraint columns in the order SQLite knows them in.
+        If no matching constraint exists, create a unique index when schema
+        changes are allowed, otherwise fail before any data is written.
+        """
+        key_set = set(key_names)
+        primary_key = [column.name for column in self.table.primary_key.columns]
+        if set(primary_key) == key_set:
+            return primary_key
+
+        inspector = self.db.inspect
+        for index in inspector.get_indexes(self.name, schema=self.db.schema):
+            if index.get("unique"):
+                columns = index.get("column_names", [])
+                if set(columns) == key_set:
+                    return list(columns)
+        for constraint in inspector.get_unique_constraints(
+            self.name, schema=self.db.schema
+        ):
+            columns = constraint.get("column_names", [])
+            if set(columns) == key_set:
+                return list(columns)
+
+        if not self._check_ensure(ensure):
+            raise DatasetError(
+                f"Cannot bulk upsert on keys {list(key_names)!r}: no PRIMARY "
+                "KEY or UNIQUE constraint covers these columns, and schema "
+                "changes are disabled (ensure=False)."
+            )
+
+        with self.db.lock:
+            self._threading_warn()
+            index = Index(
+                index_name(self.name, list(key_names)),
+                *[self.table.c[key] for key in key_names],
+                unique=True,
+            )
+            try:
+                index.create(self.db.executable)
+            except (IntegrityError, OperationalError) as exc:
+                raise DatasetError(
+                    f"Cannot bulk upsert on keys {list(key_names)!r}: existing "
+                    "rows are not unique on these columns, so no UNIQUE "
+                    "constraint could be created to locate rows reliably."
+                ) from exc
+            self.db._auto_commit()
+        return list(key_names)
+
+    def _build_sqlite_upsert_statement(
+        self,
+        key_names: Sequence[str],
+        data_columns: Sequence[str],
+        conflict_target: Sequence[str],
+    ) -> SqlInsert:
+        """Build the parameterized ON CONFLICT DO UPDATE statement.
+
+        Each data column gets a value bind (``_v_<col>``) and a presence flag
+        (``_s_<col>``). On conflict the flag decides whether the supplied
+        value (which may be explicit NULL) is written or the old column value
+        is kept, so missing fields never clear stored data.
+        """
+        table = self.table
+        set_values: dict[str, Any] = {}
+        insert_values: dict[str, Any] = {}
+        for column in data_columns:
+            set_values[column] = case(
+                (bindparam(f"_s_{column}"), bindparam(f"_v_{column}")),
+                else_=table.c[column],
+            )
+            insert_values[column] = bindparam(f"_v_{column}")
+        for key in key_names:
+            insert_values[key] = bindparam(key)
+        insert_statement = sqlite_insert(table).values(**insert_values)
+        if not set_values:
+            # Rows only carry key columns: an existing match has nothing to
+            # update, matching the row-by-row path (empty update, no insert).
+            return insert_statement.on_conflict_do_nothing(
+                index_elements=list(conflict_target)
+            )
+        return insert_statement.on_conflict_do_update(
+            index_elements=list(conflict_target),
+            set_=set_values,
+        )
+
+    def _build_upsert_params(
+        self,
+        rows: Sequence[WriteRow],
+        key_names: Sequence[str],
+        data_columns: Sequence[str],
+    ) -> list[MutableRow]:
+        """Convert input rows to bind-parameter dicts without mutating them.
+
+        Rows sharing a composite key are merged in input order: a later row
+        only overwrites a column when it actually provides one. An explicit
+        ``None`` counts as provided (flag stays 1) and writes SQL NULL, while
+        a missing column keeps the value carried by an earlier row. This
+        matters because SQLite evaluates ``DO UPDATE`` expressions against
+        the pre-conflict row, so repeating a key within one executemany could
+        otherwise erase values inserted moments earlier in the same batch.
+        """
+        normalized_keys = [normalize_column_key(key) for key in key_names]
+        normalized_data = [normalize_column_key(column) for column in data_columns]
+        param_rows: list[MutableRow] = []
+        merged_index: dict[tuple[Any, ...], int] = {}
         for row in rows:
-            self.upsert(row, keys, ensure=ensure, types=types)
+            lookup: dict[str, str] = {}
+            for name in row:
+                column_key = normalize_column_key(name)
+                if column_key is not None:
+                    lookup[column_key] = name
+            key_values = []
+            for key, key_key in zip(key_names, normalized_keys):
+                if key_key is None:
+                    raise DatasetError(f"{key!r} is not a valid key column.")
+                actual_key = lookup[key_key]
+                key_values.append(row[actual_key])
+            params_key = tuple(key_values)
+            if params_key in merged_index:
+                params = param_rows[merged_index[params_key]]
+            else:
+                params = {}
+                for key, value in zip(key_names, key_values):
+                    params[key] = value
+                for column in data_columns:
+                    params[f"_v_{column}"] = None
+                    params[f"_s_{column}"] = 0
+                merged_index[params_key] = len(param_rows)
+                param_rows.append(params)
+            for column, column_key in zip(data_columns, normalized_data):
+                actual = lookup.get(column_key)
+                if actual is not None:
+                    params[f"_v_{column}"] = row[actual]
+                    params[f"_s_{column}"] = 1
+        return param_rows
+
+    def _sqlite_upsert_many(
+        self,
+        rows: Sequence[WriteRow],
+        keys: Sequence[str],
+        chunk_size: int,
+        ensure: bool | None,
+        types: dict[str, ColumnType] | None,
+    ) -> None:
+        """SQLite-native batched upsert preserving row-by-row semantics."""
+        if len(rows) == 0:
+            return
+        key_names = [
+            self._get_column_name(key) for key in ensure_strings(keys)
+        ]
+        if not key_names:
+            raise DatasetError("upsert_many requires at least one key column.")
+        if chunk_size <= 0:
+            raise DatasetError("chunk_size must be a positive integer.")
+
+        # Key presence/NULL checks must fail before any table or column is
+        # created, so an invalid batch never changes the schema.
+        self._validate_upsert_key_values(rows, key_names)
+
+        # Sync any missing table/columns once, using the first value seen for
+        # each column so type guessing matches the row-by-row path. The table
+        # is reflected here; everything afterwards resolves columns in memory.
+        # Touching ``table`` first forces a single reflection (or table
+        # creation), so ``_get_column_name`` below never hits the database.
+        self.table
+        sync_row: MutableRow = {}
+        sync_name_by_key: dict[str, str] = {}
+        for row in rows:
+            for name, value in row.items():
+                resolved = self._get_column_name(name)
+                column_key = normalize_column_key(resolved)
+                if column_key is not None and column_key in sync_name_by_key:
+                    # Case-insensitive duplicate within the batch itself; the
+                    # table cannot exist yet for this column, so collapse onto
+                    # the first spelling instead of creating two columns.
+                    resolved = sync_name_by_key[column_key]
+                elif resolved not in sync_row:
+                    sync_row[resolved] = value
+                    if column_key is not None:
+                        sync_name_by_key[column_key] = resolved
+        self._sync_columns(sync_row, ensure, types=types)
+
+        # Take one schema snapshot and resolve everything against it instead
+        # of triggering reflection per row/column via has_column().
+        column_keys = self._column_keys
+        # Key names given by the caller are normalized onto real columns.
+        resolved_key_names: list[str] = []
+        for key in key_names:
+            actual = column_keys.get(normalize_column_key(key), key)
+            resolved_key_names.append(actual)
+        key_names = resolved_key_names
+        key_key_set = {normalize_column_key(key) for key in key_names}
+
+        # After syncing, every key column must actually exist.
+        self._validate_upsert_key_columns(key_names, column_keys)
+
+        # Data columns follow first-seen order across the batch, restricted to
+        # columns that actually exist on the table.
+        data_columns: list[str] = []
+        seen_data_keys: set[str] = set()
+        for row in rows:
+            for name in row:
+                column_key = normalize_column_key(name)
+                if column_key is None or column_key in key_key_set:
+                    continue
+                actual_column = column_keys.get(column_key)
+                if actual_column is not None and column_key not in seen_data_keys:
+                    seen_data_keys.add(column_key)
+                    data_columns.append(actual_column)
+
+        conflict_target = self._resolve_conflict_target(key_names, ensure)
+        statement = self._build_sqlite_upsert_statement(
+            key_names, data_columns, conflict_target
+        )
+        param_rows = self._build_upsert_params(rows, key_names, data_columns)
+
+        # Each row binds one value per key plus a value/flag pair per data
+        # column. Split conservatively so SQLite's variable limit is never
+        # exceeded, even when insertmanyvalues re-batches the rows.
+        params_per_row = len(key_names) + 2 * len(data_columns)
+        variable_limit = self._sqlite_variable_limit()
+        if params_per_row > variable_limit:
+            raise DatasetError(
+                "Cannot bulk upsert: a single row needs "
+                f"{params_per_row} SQL parameters but SQLite allows at most "
+                f"{variable_limit}."
+            )
+        rows_per_chunk = min(chunk_size, variable_limit // params_per_row)
+
+        own_transaction = not self.db.in_transaction
+        if own_transaction:
+            self.db.begin()
+        try:
+            for start in range(0, len(param_rows), rows_per_chunk):
+                chunk = param_rows[start : start + rows_per_chunk]
+                self.db.executable.execute(statement, chunk)
+        except (IntegrityError, OperationalError) as exc:
+            if own_transaction:
+                self.db.rollback()
+            raise DatasetError(
+                "Bulk upsert failed and the whole batch was rolled back: "
+                f"{exc.orig}"
+            ) from exc
+        except Exception:
+            if own_transaction:
+                self.db.rollback()
+            raise
+        if own_transaction:
+            self.db.commit()
 
     def delete(self, *clauses: ColumnElement[bool], **filters: SQLWriteValue) -> bool:
         """Delete rows from the table.
